@@ -36,7 +36,7 @@ Pull requests are welcome.
 ## References
 
 * [Regular-expression derivatives reexamined][redr]
-* [regex-applicative][re]
+* [regex-applicative][ra]
  
 [redr]: http://www.mpi-sws.org/~turon/re-deriv.pdf
 [ra]: http://github.com/feuerbach/regex-applicative
