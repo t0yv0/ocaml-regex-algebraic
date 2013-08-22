@@ -1,165 +1,168 @@
-open Format
+module Ev = Evidence
+module F = Format
+module Tr = Transforms
 
-type t =
+(** Regular expression. *)
+type shape =
+(** Matches any single token. *)
 | Any
+(** Matches either pattern. *)
+| Choice of shape * shape
+(** Matches the empty string. *)
 | Empty
+(** Matches nothing. *)
 | Fail
-| Or of t * t
-| Seq of t * t
-| Star of t
-| Tok of Token.t
+(** Matches a sequence of two patterns. *)
+| Seq of shape * shape
+(** Matches zero or more occurences of a pattern. *)
+| Star of shape
+(** Matches a given token. *)
+| Token of Token.t
 
-let rec format ppf = function
-  | Any -> fprintf ppf "?"
-  | Empty -> fprintf ppf "E"
-  | Fail -> fprintf ppf "F"
-  | Or (a, b) -> fprintf ppf "@[(%a + %a)@]" format a format b
-  | Seq (a, b) -> fprintf ppf "@[(%a * %a)@]" format a format b
-  | Star x -> fprintf ppf "@[(* %a)@]" format x
-  | Tok t -> fprintf ppf "T%i" t
+(** Pretty-printer for regexes. *)
+let rec format_shape ppf s =
+  let f = format_shape in
+  match s with
+  | Any -> F.fprintf ppf "Any"
+  | Choice (a, b) -> F.fprintf ppf "@[Choice (%a, %a)@]" f a f b
+  | Empty -> F.fprintf ppf "Empty"
+  | Fail -> F.fprintf ppf "Fail"
+  | Seq (a, b) -> F.fprintf ppf "@[Seq (%a, %a)@]" f a f b
+  | Star x -> F.fprintf ppf "@[Star (%a)@]" f x
+  | Token t -> F.fprintf ppf "Token %i" t
 
-let fmt ppf t =
-  fprintf ppf "%a@." format t
+let print_shape = format_shape F.std_formatter
+let show_shape s = format_shape F.str_formatter s; F.flush_str_formatter ()
 
-let print = fmt std_formatter
+(** A regex in normal form under rewrite rules, together with a
+    transform from NF evidence to the original evidence. *)
+type t =
+| Rx of shape * Tr.t
 
-let any = Any
-let empty = Empty
-let fail = Fail
-let choice a b = Or (a, b)
-let seq a b = Seq (a, b)
-let star x = Star x
-let tok x = Tok x
+let get_shape (Rx (s, _)) = s
+let get_transform (Rx (_, t)) = t
 
-let tag r =
-  match r with
-  | Any -> 0
-  | Empty -> 1
-  | Fail -> 2
-  | Or _ -> 3
-  | Seq _ -> 4
-  | Star _ -> 5
-  | Tok _ -> 6
+let rx x = Rx (x, Tr.id)
 
-let rec cmp a b =
+let any = rx Any
+let empty = rx Empty
+let fail = rx Fail
+let token t = rx (Token t)
+
+(** Arbitrary comparison on regexes. *)
+let rec cmp_shape a b =
+  let tag r =
+    match r with
+    | Any -> 1
+    | Choice _ -> 4
+    | Empty -> 2
+    | Fail -> 3
+    | Seq _ -> 5
+    | Star _ -> 6
+    | Token _ -> 0 in
   match Cmp.ints (tag a) (tag b) with
   | Cmp.Eq ->
     begin
       match a, b with
-      | Tok a, Tok b -> Token.cmp a b
-      | Star a, Star b -> cmp a b
-      | Or (a1, a2), Or (b1, b2)
+      | Token a, Token b -> Token.cmp a b
+      | Star a, Star b -> cmp_shape a b
+      | Choice (a1, a2), Choice (b1, b2)
       | Seq (a1, a2), Seq (b1, b2) ->
-	begin
-	  match cmp a1 b1 with
-	  | Cmp.Eq -> cmp a2 b2
-	  | r -> r
-	end
+        begin
+          match cmp_shape a1 b1 with
+          | Cmp.Eq -> cmp_shape a2 b2
+          | r -> r
+        end
       | _ -> Cmp.Eq
     end
   | r -> r
 
-let undef () =
-  failwith "Rx: impossible"
-
 let ( <.> ) = Tr.compose
 
-(*
-  Or (Fail, x) = x
-  Or (x, Fail) = x
-  Or (a, b) [a = b] = a
-  Or (a, b) [a > b] = Or (b, a)
-  Or (Or (a, b), c) = Or (a, (b, c))
-*)
+let with_tr (Rx (r, t)) tp =
+  Rx (r, tp <.> t)
 
-let rec choice_opt a b =
+(* The `choice` smart constructor performs automatic left-to-right
+   rewriting according to the following identities:
+
+   Choice (Fail, x) = x
+   Choice (x, Fail) = x
+   Choice (a, b) [a = b] = a
+   Choice (a, b) [a > b] = Choice (b, a)
+   Choice (Choice (a, b), c) = Choice (a, Choice (b, c)) *)
+let rec choice a b =
   match a, b with
-  | Fail, x -> (x, Tr.choice2)
-  | x, Fail -> (x, Tr.choice1)
-  | Or (a, b), c ->
-    let (bc, tbc) = choice_opt b c in
-    let (abc, t) = choice_opt a bc in
-    (abc, Tr.choice_assoc tbc <.> t)
-  | _ ->
-    match cmp a b with
-    | Cmp.Eq -> (a, Tr.choice1)
-    | Cmp.Gt -> (Or (b, a), Tr.flip)
-    | Cmp.Lt -> (Or (a, b), Tr.id)
+  | Rx (Fail, _), x -> with_tr x Tr.choice2
+  | x, Rx (Fail, _) -> with_tr x Tr.choice1
+  | Rx (Choice (x, y), t), z ->
+    let ( @+ ) = choice in
+    with_tr (rx x @+ rx y @+ z) (Tr.choice_assoc t)
+  | Rx (ap, ta), Rx (bp, tb) ->
+    match cmp_shape ap bp with
+    | Cmp.Eq -> with_tr a Tr.choice1
+    | Cmp.Gt -> with_tr (choice b a) Tr.flip
+    | Cmp.Lt -> Rx (Choice (ap, bp), Tr.choice ta tb)
 
-(*
-  Seq (Fail, _) = Fail
-  Seq (_, Fail) = Fail
-  Seq (Empty, x) = x
-  Seq (x, Empty) = x
-  Seq (Seq (a, b), c) = Seq (a, Seq (b, c))
-*)
+(* Likewise, the `seq` smart constructor performs rewrites according
+   to its own identities:
 
-let rec seq_opt a b =
+   Seq (Fail, _) = Fail
+   Seq (_, Fail) = Fail
+   Seq (Empty, x) = x
+   Seq (x, Empty) = x
+   Seq (Seq (a, b), c) = Seq (a, Seq (b, c)) *)
+let rec seq a b =
   match a, b with
-  | Fail, _ | _, Fail -> (Fail, Tr.fail)
-  | Empty, x -> (x, Tr.seq_intro1 Ev.empty)
-  | x, Empty -> (x, Tr.seq_intro2 Ev.empty)
-  | Seq (a, b), c ->
-    let (bc, tbc) = seq_opt b c in
-    let (abc, t) = seq_opt a bc in
-    (abc, Tr.seq_assoc tbc <.> t)
-  | _ ->
-    (Seq (a, b), Tr.id)
+  | Rx (Fail, _), _ | _, Rx (Fail, _) -> fail
+  | Rx (Empty, t), x -> with_tr x (Tr.seq_intro1 (Tr.apply t Ev.empty))
+  | x, Rx (Empty, t) -> with_tr x (Tr.seq_intro2 (Tr.apply t Ev.empty))
+  | Rx (Seq (x, y), t), z ->
+    let ( @* ) = seq in
+    with_tr (rx x @* rx y @* z) (Tr.seq_assoc t)
+  | Rx (ap, ta), Rx (bp, tb) ->
+    Rx (Seq (ap, bp), Tr.seq ta tb)
 
-let rec null r =
+let star (Rx (p, t)) =
+  Rx (Star p, Tr.star_map t)
+
+let rec n r =
   match r with
   | Any -> None
   | Empty -> Some Ev.empty
   | Fail -> None
-  | Or (a, b) ->
+  | Choice (a, b) ->
     begin
-      match null a with
+      match n a with
       | None ->
-	begin
-	  match null b with
-	  | None -> None
-	  | Some eb -> Some (Ev.or2 eb)
-	end
-      | Some ea -> Some (Ev.or1 ea)
+        begin
+          match n b with
+          | None -> None
+          | Some eb -> Some (Ev.choice2 eb)
+        end
+      | Some ea -> Some (Ev.choice1 ea)
     end
   | Seq (a, b) ->
     begin
-      match null a, null b with
+      match n a, n b with
       | Some x, Some y -> Some (Ev.seq x y)
       | _ -> None
     end
   | Star _ -> Some Ev.empty
-  | Tok t -> None
+  | Token t -> None
 
 let rec d t r =
   match r with
-  | Any ->
-    (Empty, Tr.const (Ev.any t))
-  | Empty | Fail ->
-    (Fail, Tr.fail)
-  | Tok x ->
-    if Token.eq x t then
-      (Empty, Tr.const (Ev.token t))
-    else
-      (Fail, Tr.fail)
-  | Or (a, b) ->
-    let (da, ta) = d t a in
-    let (db, tb) = d t b in
-    let (r, tr) = choice_opt da db in
-    (r, Tr.choice ta tb <.> tr)
+  | Any -> Rx (Empty, Tr.const (Ev.any t))
+  | Token x when Token.eq x t -> Rx (Empty, Tr.const (Ev.token t))
+  | Empty | Fail | Token _ -> Rx (Fail, Tr.fail)
+  | Choice (a, b) -> choice (d t a) (d t b)
   | Seq (a, b) ->
-    let (da, ta) = d t a in
-    let (dab, tdab_opt) = seq_opt da b in
-    let tdab = Tr.seq ta Tr.id <.> tdab_opt in
     begin
-      match null a with
-      | None -> (dab, tdab)
+      match n a with
+      | None ->	seq (d t a) (rx b)
       | Some e ->
-	let (db, tb) = d t b in
-	let (r, tr) = choice_opt dab db in
-	(r, Tr.choice_match tdab (Tr.seq_intro1 e <.> tb) <.> tr)
+    	let r = choice (seq (d t a) (rx b)) (d t b) in
+    	with_tr r (Tr.seq_d e)
     end
   | Star a ->
-    let (da, ta) = d t a in
-    let (dar, t) = seq_opt da r in
-    (dar, Tr.seq ta Tr.id <.> t)
+    seq (d t a) (rx r)
